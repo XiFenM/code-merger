@@ -1,0 +1,115 @@
+import os
+from datetime import datetime
+
+try:
+    from docx import Document
+    from docx.shared import Pt
+    from docx.opc.exceptions import PackageNotFoundError
+except ImportError:
+    Document = None
+
+
+def read_text_file(path):
+    """Read file content with best-effort encodings suitable for CN/UTF-8.
+    Returns (text, encoding_used).
+    """
+    encodings = ["utf-8", "gb18030", "cp936", "latin-1"]
+    for enc in encodings:
+        try:
+            with open(path, "r", encoding=enc, errors="strict") as f:
+                return f.read(), enc
+        except Exception:
+            continue
+    # Fallback with replace to avoid crash
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read(), "utf-8(replace)"
+    except Exception:
+        return "", "unknown"
+
+
+def add_filename_paragraph(doc, rel_path):
+    p = doc.add_paragraph()
+    run = p.add_run(f"文件: {rel_path}")
+    run.bold = True
+    run.font.size = Pt(12)
+
+
+def clean_consecutive_newlines(text):
+    """Merge consecutive newlines into single newlines to reduce document length."""
+    import re
+    # Replace 2 or more consecutive newlines with a single newline
+    return re.sub(r'\n{2,}', '\n', text)
+
+
+def add_code_block(doc, content):
+    # Clean consecutive newlines before adding to document
+    cleaned_content = clean_consecutive_newlines(content)
+    # Add code content as a single run with monospace font for readability
+    p = doc.add_paragraph()
+    run = p.add_run(cleaned_content)
+    run.font.name = "Consolas"
+    run.font.size = Pt(10)
+
+
+def main():
+    # Adjust paths for the user's workspace on Windows
+    workspace_root = r"/root/workspace/code-merger/StudentInfo"
+    source_root = os.path.join(workspace_root, "src")
+    output_docx = os.path.join(workspace_root, "导出.docx")
+
+    if Document is None:
+        print("python-docx 未安装。请先安装后再运行此脚本。")
+        return 1
+
+    # Open existing document if present, otherwise create new
+    if os.path.exists(output_docx):
+        try:
+            doc = Document(output_docx)
+            doc.add_paragraph()  # spacing before new content
+            doc.add_paragraph(f"追加时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        except (PackageNotFoundError, KeyError, ValueError):
+            # 如果现有文件不可读或不是有效docx，则重新创建
+            print("现有导出.docx不是有效的docx，将覆盖生成新的文档。")
+            doc = Document()
+            doc.add_paragraph(f"导出时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    else:
+        doc = Document()
+        doc.add_paragraph(f"导出时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    if not os.path.isdir(source_root):
+        print(f"未找到源目录: {source_root}")
+        return 2
+
+    target_exts = {".java", ".vue"}
+    processed = 0
+    skipped = 0
+
+    for root, dirs, files in os.walk(source_root):
+        # Optionally skip bulky directories if needed (none by default)
+        for fname in files:
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in target_exts:
+                continue
+
+            fpath = os.path.join(root, fname)
+            rel_path = os.path.relpath(fpath, start=source_root)
+            text, enc = read_text_file(fpath)
+            if text == "":
+                skipped += 1
+                continue
+
+            add_filename_paragraph(doc, rel_path)
+            add_code_block(doc, text)
+            # Separator line
+            doc.add_paragraph("\n" + ("-" * 80) + "\n")
+            processed += 1
+
+    doc.save(output_docx)
+    print(f"已处理文件: {processed}, 跳过文件: {skipped}")
+    print(f"输出文档: {output_docx}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
