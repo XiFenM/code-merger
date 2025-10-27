@@ -13,6 +13,10 @@ Code Merger - 将指定文件夹中的代码文件整合成docx文档
 import os
 import sys
 import re
+import zipfile
+import tarfile
+import tempfile
+import shutil
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime
@@ -21,6 +25,11 @@ from docx import Document
 from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.opc.exceptions import PackageNotFoundError
+
+try:
+    import rarfile
+except ImportError:
+    rarfile = None
 
 
 def read_text_file_with_encoding(path: Path) -> Tuple[str, str]:
@@ -54,6 +63,107 @@ def clean_consecutive_newlines(text: str) -> str:
     return re.sub(r'\n{3,}', '\n\n', text)
 
 
+def extract_archive(archive_path: Path, extract_dir: Path) -> Path:
+    """
+    解压压缩包文件
+    支持 zip, tar, tar.gz, tar.bz2 格式
+    返回解压后的目录路径
+    """
+    archive_path = Path(archive_path)
+    extract_dir = Path(extract_dir)
+
+    if not archive_path.exists():
+        raise FileNotFoundError(f"压缩包文件不存在: {archive_path}")
+
+    # 创建解压目录
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"正在解压: {archive_path}")
+
+    try:
+        if archive_path.suffix.lower() in ['.zip']:
+            with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_dir)
+                print(f"✅ ZIP文件解压完成: {extract_dir}")
+
+        elif archive_path.suffix.lower() in ['.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz2']:
+            with tarfile.open(archive_path, 'r:*') as tar_ref:
+                tar_ref.extractall(extract_dir)
+                print(f"✅ TAR文件解压完成: {extract_dir}")
+
+        elif archive_path.suffix.lower() in ['.rar']:
+            # 使用7z工具解压RAR文件
+            import subprocess
+            try:
+                result = subprocess.run(
+                    ['7z', 'x', str(archive_path), f'-o{extract_dir}', '-y'],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                print(f"✅ RAR文件解压完成: {extract_dir}")
+            except subprocess.CalledProcessError as e:
+                raise ValueError(
+                    f"RAR文件解压失败: {e.stderr}\n"
+                    "请确保已安装 7z 工具: sudo apt-get install p7zip-full"
+                ) from e
+            except FileNotFoundError:
+                raise ValueError(
+                    "RAR文件解压需要 7z 工具支持。\n"
+                    "请安装 p7zip-full: sudo apt-get install p7zip-full\n"
+                    "或者使用 ZIP 或 TAR 格式的压缩包。"
+                )
+
+        else:
+            raise ValueError(f"不支持的压缩包格式: {archive_path.suffix}")
+
+        return extract_dir
+
+    except Exception as e:
+        # 清理失败的解压目录
+        if extract_dir.exists():
+            shutil.rmtree(extract_dir)
+        raise Exception(f"解压失败: {e}")
+
+
+def is_archive_file(file_path: Path) -> bool:
+    """
+    检查文件是否为支持的压缩包格式
+    """
+    supported_archives = ['.zip', '.rar', '.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz2']
+    return file_path.suffix.lower() in supported_archives
+
+
+def process_archive_input(input_path: Path) -> Path:
+    """
+    处理输入路径：如果是压缩包则解压，返回实际处理的目录路径
+    """
+    input_path = Path(input_path)
+
+    if input_path.is_dir():
+        # 已经是目录，直接返回
+        return input_path
+
+    elif input_path.is_file() and is_archive_file(input_path):
+        # 是压缩包文件，解压到临时目录
+        temp_dir = tempfile.mkdtemp(prefix="code_merger_")
+        print(f"检测到压缩包，创建临时目录: {temp_dir}")
+
+        try:
+            extracted_dir = extract_archive(input_path, Path(temp_dir))
+            print(f"✅ 压缩包解压完成，开始扫描解压后的文件")
+            return extracted_dir
+
+        except Exception as e:
+            # 清理临时目录
+            if Path(temp_dir).exists():
+                shutil.rmtree(temp_dir)
+            raise Exception(f"压缩包处理失败: {e}")
+
+    else:
+        raise ValueError(f"输入路径既不是目录也不是支持的压缩包: {input_path}")
+
+
 class CodeFile:
     """代码文件类 - 改进版本"""
 
@@ -70,20 +180,14 @@ class CodeFile:
         ext = self.file_path.suffix.lower()
         language_map = {
             '.java': 'Java',
-            '.js': 'JavaScript',
-            '.ts': 'TypeScript',
             '.vue': 'Vue',
-            '.html': 'HTML',
-            '.css': 'CSS',
-            '.scss': 'SCSS',
+            '.jsx': 'JavaScript (JSX)',
+            '.tsx': 'TypeScript (TSX)',
+            '.wxml': 'WXML',
             '.xml': 'XML',
-            '.yml': 'YAML',
-            '.yaml': 'YAML',
-            '.properties': 'Properties',
-            '.json': 'JSON',
-            '.md': 'Markdown',
-            '.py': 'Python',
-            '.go': 'Go',
+            '.sh': 'Shell Script',
+            '.bat': 'Batch Script',
+            '.redis': 'Redis',
             '.sql': 'SQL'
         }
         return language_map.get(ext, 'Text')
@@ -112,12 +216,9 @@ class CodeMerger:
     def __init__(self):
         self.code_files: List[CodeFile] = []
         self.supported_extensions = {
-            # Java/Spring Boot
-            '.java', '.xml', '.yml', '.yaml', '.properties',
-            # Vue.js/前端
-            '.js', '.ts', '.vue', '.html', '.css', '.scss', '.json',
-            # 其他常见文件
-            '.md', '.py', '.go', '.sql'
+            # 仅支持指定的代码文件格式
+            '.java', '.vue', '.jsx', '.tsx', '.wxml', '.xml',
+            '.sh', '.bat', '.redis', '.sql'
         }
         self.ignore_patterns = {
             'node_modules', 'dist', 'build', 'target', '.git', '.idea',
@@ -129,15 +230,18 @@ class CodeMerger:
         }
 
     def scan_directory(self, directory: Path) -> None:
-        """扫描目录中的代码文件"""
+        """扫描目录中的代码文件 - 按字母顺序排序"""
         print(f"正在扫描目录: {directory}")
 
         processed = 0
         skipped = 0
 
         for root, dirs, files in os.walk(directory):
-            # 过滤掉需要忽略的目录
-            dirs[:] = [d for d in dirs if d not in self.ignore_patterns]
+            # 过滤掉需要忽略的目录，并按字母顺序排序
+            dirs[:] = sorted([d for d in dirs if d not in self.ignore_patterns])
+
+            # 按字母顺序排序文件
+            files = sorted(files)
 
             for file in files:
                 file_path = Path(root) / file
@@ -263,7 +367,7 @@ class CodeMerger:
             self._add_code_block(doc, code_file.content)
 
             # 分隔符
-            doc.add_paragraph("\n" + ("-" * 80) + "\n")
+            doc.add_paragraph("\n" + ("-" * 64) + "\n")
 
     def _add_code_block(self, doc: Document, content: str) -> None:
         """添加代码块 - 使用export.py的优化方法"""
@@ -280,9 +384,9 @@ class CodeMerger:
 
 @click.command()
 @click.option('--input-dir', '-i',
-              type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+              type=click.Path(exists=True, file_okay=True, dir_okay=True, path_type=Path),
               required=True,
-              help='输入目录路径')
+              help='输入目录路径或压缩包文件路径')
 @click.option('--output', '-o',
               type=click.Path(path_type=Path),
               default='code_document.docx',
@@ -302,17 +406,30 @@ def main(input_dir: Path, output: Path, project_name: str, append: bool, verbose
 
     支持Java/Spring Boot和Vue.js项目，自动识别文件类型并保持代码格式。
     改进版本，提供更好的编码支持和文档追加功能。
+
+    新增功能：
+    - 支持 jsx, tsx, wxml, sh, bat, redis 文件类型
+    - 支持直接输入压缩包路径（zip, tar, tar.gz, tar.bz2）
+    - 自动解压并扫描压缩包内的代码文件
     """
     if verbose:
-        print(f"输入目录: {input_dir}")
+        print(f"输入路径: {input_dir}")
         print(f"输出文件: {output}")
         print(f"追加模式: {'是' if append else '否'}")
         if project_name:
             print(f"项目名称: {project_name}")
 
+    temp_dir = None
     try:
+        # 处理输入路径：如果是压缩包则解压
+        actual_input_dir = process_archive_input(input_dir)
+
+        # 如果是临时目录（压缩包解压的），记录下来以便后续清理
+        if str(actual_input_dir).startswith(tempfile.gettempdir()):
+            temp_dir = actual_input_dir
+
         merger = CodeMerger()
-        merger.scan_directory(input_dir)
+        merger.scan_directory(actual_input_dir)
 
         if not merger.code_files:
             print("警告: 未找到任何支持的代码文件")
@@ -324,6 +441,16 @@ def main(input_dir: Path, output: Path, project_name: str, append: bool, verbose
     except Exception as e:
         print(f"❌ 错误: {e}")
         sys.exit(1)
+    finally:
+        # 清理临时目录（如果是压缩包解压的）
+        if temp_dir and temp_dir.exists():
+            try:
+                shutil.rmtree(temp_dir)
+                if verbose:
+                    print(f"✅ 已清理临时目录: {temp_dir}")
+            except Exception as e:
+                if verbose:
+                    print(f"⚠️ 清理临时目录失败: {e}")
 
 
 if __name__ == "__main__":
